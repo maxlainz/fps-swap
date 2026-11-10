@@ -2,7 +2,7 @@
 //! list of fixed-width overwrites. Nothing here touches the file.
 
 use crate::Refusal;
-use crate::atoms::{Field, Movie, Track, be16, be32, be64, fourcc};
+use crate::atoms::{Field, Movie, Track, be16, be32, be64, children, fourcc};
 
 /// Uncompressed audio sample entry formats (QuickTime and ISO).
 const PCM: [&[u8; 4]; 9] = [
@@ -10,6 +10,7 @@ const PCM: [&[u8; 4]; 9] = [
 ];
 /// QuickTime `tmcd` flags.
 const TC_DROP_FRAME: u32 = 0x1;
+const TC_NEGATIVE: u32 = 0x4;
 const TC_COUNTER: u32 = 0x8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,10 +140,11 @@ pub fn plan(m: &Movie, target: Target) -> Result<Plan, Refusal> {
         tc_before: None,
         tc_after: None,
     };
-    let tc = m
-        .tracks
-        .iter()
-        .find(|t| &t.handler == b"tmcd" && !t.tc_samples.is_empty());
+    let tc = m.tracks.iter().find(|t| {
+        &t.handler == b"tmcd"
+            && !t.tc_samples.is_empty()
+            && matches!(tc_unconvertible(t, den), Ok(None))
+    });
     if let Some(t) = tc {
         p.tc_before = Some(tc_label(u64::from(t.tc_samples[0].1), den));
     }
@@ -162,8 +164,14 @@ pub fn plan(m: &Movie, target: Target) -> Result<Plan, Refusal> {
         };
         put(&mut p.patches, &t.timescale, new_ts);
         match &t.handler {
-            b"soun" => audio(t, ts, new_ts, &mut p.patches)?,
-            b"tmcd" => timecode(t, den, num, &mut p)?,
+            b"soun" => audio(t, ts, new_ts, &mut p)?,
+            b"tmcd" => match tc_unconvertible(t, den)? {
+                None => timecode(t, den, num, &mut p)?,
+                Some(why) => p.warnings.push(format!(
+                    "timecode track {} not converted ({why}); only its timescale was changed, so it may read differently",
+                    t.id
+                )),
+            },
             _ => {}
         }
     }
@@ -174,6 +182,7 @@ pub fn plan(m: &Movie, target: Target) -> Result<Plan, Refusal> {
     } else {
         p.movie_rescaled = true;
         let fields = std::iter::once(&m.duration)
+            .chain(&m.mvhd_times)
             .chain(m.tracks.iter().map(|t| &t.tkhd_duration))
             .chain(m.tracks.iter().flat_map(|t| &t.elst));
         for f in fields {
@@ -197,7 +206,7 @@ pub fn plan(m: &Movie, target: Target) -> Result<Plan, Refusal> {
     Ok(p)
 }
 
-fn audio(t: &Track, old: u64, new: u64, patches: &mut Vec<Patch>) -> Result<(), Refusal> {
+fn audio(t: &Track, old: u64, new: u64, p: &mut Plan) -> Result<(), Refusal> {
     for e in &t.entries {
         if !PCM.contains(&&e.format) {
             return refuse(format!(
@@ -207,19 +216,33 @@ fn audio(t: &Track, old: u64, new: u64, patches: &mut Vec<Patch>) -> Result<(), 
         }
         let b = &e.bytes;
         let bad = || Refusal("malformed file: short sound sample description".into());
+        let mut mismatch = || {
+            // ISO `ipcm` above 65535 Hz keeps the real rate in an 'srat' child box.
+            let srat = children(b, 36.min(b.len()), b.len())
+                .is_ok_and(|k| k.iter().any(|c| &c.typ == b"srat"));
+            let why = if srat {
+                "its sample rate is in an 'srat' box, a sample description layout that is not supported"
+            } else {
+                "its declared sample rate does not match the media timescale"
+            };
+            p.warnings.push(format!(
+                "audio track {} ('{}'): {why}; only the timescale was changed and the declared rate left as is, so audio sync is not guaranteed",
+                t.id,
+                fourcc(&e.format)
+            ));
+        };
         // Byte 16 is the QuickTime sound description version (0 in ISO files).
         match be16(b, 16).ok_or_else(bad)? {
             0 | 1 => {
                 let rate = be32(b, 32).ok_or_else(bad)?;
                 if u64::from(rate) != old << 16 {
-                    return refuse(
-                        "unsupported audio: sample rate does not match the media timescale",
-                    );
+                    mismatch();
+                    continue;
                 }
                 if new > 0xFFFF {
                     return refuse(format!("field overflow: audio rate {new} does not fit"));
                 }
-                patches.push(Patch {
+                p.patches.push(Patch {
                     off: e.off + 32,
                     bytes: ((new as u32) << 16).to_be_bytes().to_vec(),
                 });
@@ -227,11 +250,10 @@ fn audio(t: &Track, old: u64, new: u64, patches: &mut Vec<Patch>) -> Result<(), 
             2 => {
                 let rate = f64::from_bits(be64(b, 40).ok_or_else(bad)?);
                 if rate != old as f64 {
-                    return refuse(
-                        "unsupported audio: sample rate does not match the media timescale",
-                    );
+                    mismatch();
+                    continue;
                 }
-                patches.push(Patch {
+                p.patches.push(Patch {
                     off: e.off + 40,
                     bytes: (new as f64).to_bits().to_be_bytes().to_vec(),
                 });
@@ -242,32 +264,57 @@ fn audio(t: &Track, old: u64, new: u64, patches: &mut Vec<Patch>) -> Result<(), 
     Ok(())
 }
 
-fn timecode(t: &Track, from: u64, to: u64, p: &mut Plan) -> Result<(), Refusal> {
+/// Checks a `tmcd` track at `fps`. Refuses what can never be handled (drop-frame,
+/// unknown or short descriptions); returns why the timecode cannot be converted
+/// (counter mode, negative, a base that does not match the video, a frame number
+/// of 2^31 or more), or None when it can.
+fn tc_unconvertible(t: &Track, fps: u64) -> Result<Option<String>, Refusal> {
+    let mut why = None;
     for e in &t.entries {
         let b = &e.bytes;
-        let (Some(flags), Some(ts), Some(fd), Some(nf)) =
-            (be32(b, 20), be32(b, 24), be32(b, 28), b.get(32))
-        else {
-            return refuse("malformed file: short timecode sample description");
-        };
         if &e.format != b"tmcd" {
             return refuse(format!(
                 "unsupported timecode format '{}'",
                 fourcc(&e.format)
             ));
         }
+        let (Some(flags), Some(ts), Some(fd), Some(nf)) =
+            (be32(b, 20), be32(b, 24), be32(b, 28), b.get(32))
+        else {
+            return refuse("malformed file: short timecode sample description");
+        };
         if flags & TC_DROP_FRAME != 0 {
             return refuse("drop-frame timecode is not supported");
         }
-        if flags & TC_COUNTER != 0 {
-            return refuse("counter-mode timecode is not supported");
-        }
-        if fd == 0 || u64::from(ts) != from * u64::from(fd) || u64::from(*nf) != from {
-            return refuse(format!(
-                "unsupported timecode: {ts}/{fd} with {nf} frames does not match {from} fps"
-            ));
-        }
-        let Some(new_ts) = scale_exact(u64::from(ts), to, from, u64::from(u32::MAX)) else {
+        why = why.or(if flags & TC_COUNTER != 0 {
+            Some("counter mode".to_string())
+        } else if flags & TC_NEGATIVE != 0 {
+            Some("negative timecode".to_string())
+        } else if fd == 0 || u64::from(ts) != fps * u64::from(fd) || u64::from(*nf) != fps {
+            Some(format!(
+                "{ts}/{fd} with {nf} frames does not match {fps} fps"
+            ))
+        } else {
+            None
+        });
+    }
+    if why.is_none() && t.tc_samples.iter().any(|s| s.1 >= 1 << 31) {
+        why = Some("frame number of 2^31 or more".into());
+    }
+    Ok(why)
+}
+
+fn timecode(t: &Track, from: u64, to: u64, p: &mut Plan) -> Result<(), Refusal> {
+    if !t.tc_safe {
+        return refuse(format!(
+            "malformed timecode track {}: its samples are not inside 'mdat' or overlap another track's data",
+            t.id
+        ));
+    }
+    // Descriptions were validated by `tc_unconvertible`: ts == from * fd, nf == from.
+    for e in &t.entries {
+        let ts = u64::from(be32(&e.bytes, 24).expect("checked"));
+        let Some(new_ts) = scale_exact(ts, to, from, u64::from(u32::MAX)) else {
             return refuse("timecode timescale cannot be scaled exactly");
         };
         p.patches.push(Patch {

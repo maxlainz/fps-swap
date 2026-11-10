@@ -364,6 +364,8 @@ fn refusals_leave_files_untouched() {
     let mut perm = fs::metadata(&ro).unwrap().permissions();
     perm.set_readonly(true);
     fs::set_permissions(&ro, perm.clone()).unwrap();
+    // A dry run reaches the same verdict as the real run.
+    check_refused(&ro, &["--dry-run"], "not writable");
     check_refused(&ro, &[], "not writable");
     #[allow(clippy::permissions_set_readonly_false)]
     perm.set_readonly(false);
@@ -430,6 +432,28 @@ fn cli_modes() {
     assert!(fps_swap(&["--to", "25", p]).status.success());
     assert_eq!(fs::read(&a).unwrap(), orig);
 
+    // The same file twice, or again through a symlink, toggles once.
+    let link = dir.join("link.mov");
+    std::os::unix::fs::symlink(&a, &link).unwrap();
+    let l = link.to_str().unwrap();
+    let o = fps_swap(&[p, p, l]);
+    assert!(o.status.success());
+    let s = String::from_utf8_lossy(&o.stdout);
+    assert_eq!(s.matches("25 → 24 fps").count(), 1, "{s}");
+    assert_eq!(
+        s.matches(&format!("skipped: duplicate of {p}")).count(),
+        2,
+        "{s}"
+    );
+    let o = fps_swap(&["--json", l, p]);
+    assert!(o.status.success());
+    let s = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        s.contains("\"from\":24,\"to\":25") && s.contains("\"skipped\":true"),
+        "{s}"
+    );
+    assert_eq!(fs::read(&a).unwrap(), orig);
+
     // Usage errors exit 2.
     assert_eq!(fps_swap(&[]).status.code(), Some(2));
     assert_eq!(fps_swap(&["--to", "30", p]).status.code(), Some(2));
@@ -460,5 +484,92 @@ fn timecode_frame_24_clamps_with_warning() {
         "{s}"
     );
     assert_eq!(ff.probe(&f).3, "10:00:00:23");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn non_regular_and_non_utf8_paths() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let dir = workdir("special");
+    let fifo = dir.join("pipe.mov");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    // Not UTF-8: processed (lossily named), not a usage error.
+    let bad = dir.join(OsStr::from_bytes(b"\xffbad.mov"));
+    let o = Command::new(BIN)
+        .arg("--json")
+        .arg(&fifo)
+        .arg(&dir)
+        .arg(&bad)
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1));
+    let s = String::from_utf8_lossy(&o.stdout);
+    assert_eq!(s.matches("not a regular file").count(), 2, "{s}");
+    assert!(
+        s.contains("\u{FFFD}bad.mov") && s.contains("cannot open"),
+        "{s}"
+    );
+    let o = fps_swap(&["--dry-run", fifo.to_str().unwrap()]);
+    let e = String::from_utf8_lossy(&o.stderr);
+    assert!(e.contains("refused: not a regular file"), "{e}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pcm_rate_mismatch_converts_with_warning() {
+    let Some((ffmpeg, ffprobe)) = tools("pcm_srat") else {
+        return;
+    };
+    let ff = Ff { ffmpeg, ffprobe };
+    let dir = workdir("pcm_srat");
+    // MP4 'ipcm' above 65535 Hz stores the rate in an 'srat' box.
+    let f = dir.join("ipcm96.mp4");
+    let fs_ = f.to_str().unwrap();
+    ok(
+        &ff.ffmpeg,
+        &[
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=64x64:rate=25",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=sample_rate=96000:duration=0.5",
+            "-frames:v",
+            "17",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-c:a",
+            "pcm_s16le",
+            fs_,
+        ],
+    );
+    let hash = ff.video_hash(&f);
+    let len = fs::metadata(&f).unwrap().len();
+    let o = fps_swap(&["--json", fs_]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let s = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        s.contains("\"changed\":true")
+            && s.contains("'srat' box, a sample description layout that is not supported")
+            && s.contains("audio sync is not guaranteed"),
+        "{s}"
+    );
+    assert_eq!(ff.video_hash(&f), hash);
+    assert_eq!(fs::metadata(&f).unwrap().len(), len);
+    assert_eq!(ff.probe(&f).0, "24/1");
     let _ = fs::remove_dir_all(&dir);
 }

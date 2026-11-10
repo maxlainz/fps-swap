@@ -28,7 +28,9 @@ frames to satisfy a model's length constraints.
 ## 3. Hard guarantees
 
 G1. **Essence untouched.** No byte of any video sample is modified. Verified by
-    hashing the video packets before and after.
+    hashing the video packets before and after. The only bytes written outside
+    `moov` are timecode samples, and only when they lie entirely inside a
+    top-level `mdat` payload and overlap no chunk of any other track (see §4).
 G2. **Size preserving.** The file length never changes. Every patch overwrites
     a fixed-width field with a value of the same width.
 G3. **All or nothing on refusal.** Every check runs and every patch is computed
@@ -37,10 +39,11 @@ G4. **Frame count preserved.** Sample count per track is identical before and
     after.
 G5. **Exact rates only.** The source video rate must be exactly 24/1 or 25/1
     with a constant sample duration. The result is exactly 25/1 or 24/1.
-G6. **Round trip.** 25 → 24 → 25 yields a byte-identical file whenever every
-    timescale involved is divisible as required by Strategy A (see §4), which
-    covers every 25 fps file. Otherwise the round trip is frame-hash identical
-    and metadata-equivalent (durations within ±1 tick).
+G6. **Round trip.** 25 → 24 → 25 yields a byte-identical file when
+    `mvhd.timescale` and every `mdhd.timescale` are multiples of 25, so both
+    steps use Strategy A (see §4). Otherwise (e.g. a movie timescale of 24, or
+    1000 on the way 24 → 25) the round trip is frame-hash identical and
+    metadata-equivalent: same frames, durations within ±1 tick.
 
 ## 4. Algorithm
 
@@ -55,7 +58,9 @@ timescale = fps × delta, so the product is always an integer.
 **Strategy B — fallback for the movie timescale only.** If `mvhd.timescale × r`
 is not an integer (e.g. 1000 × 25/24), keep `mvhd.timescale` and instead
 rescale every value expressed in movie timescale by 1/r with round-half-up:
-`mvhd.duration`, each `tkhd.duration`, each `elst.segment_duration`. Handle
+`mvhd.duration`, the QuickTime `mvhd` preview time, preview duration, poster
+time, selection time, selection duration and current time (zero in ISO files;
+0 stays 0), each `tkhd.duration`, each `elst.segment_duration`. Handle
 version 0 (32-bit) and version 1 (64-bit) boxes; refuse on 32-bit overflow.
 
 If any *track* `mdhd.timescale × r` is not an integer, refuse.
@@ -70,11 +75,24 @@ If any *track* `mdhd.timescale × r` is not an integer, refuse.
   the rate in the codec config, not the container, so the audio would drift
   out of sync (measured in `docs/FINDINGS.md` §1).
   Refuse if the new rate is not an integer or does not fit the field.
+  PCM whose declared rate does not match `mdhd.timescale` (including ISO
+  `ipcm` whose rate lives in an `srat` box, a layout that is not supported) is
+  not refused: only the track timescale changes, the declared rate is left as
+  is, and a warning says audio sync is not guaranteed.
 - *Timecode (`tmcd`)* — keep the start timecode label. Patch the `tmcd` sample
   description (timescale, frame duration, number of frames) and the 32-bit
   frame-number sample(s) in `mdat` so HH:MM:SS:FF reads the same in the new
   base. If FF = 24 when going to 24 fps, clamp to 23 and emit a warning (the
   one documented non-reversible case). Refuse drop-frame timecode.
+  A sample is patched only if every chunk of the track lies entirely inside a
+  top-level `mdat` payload and overlaps no chunk (from `stsc`+`stsz`+`stco`/
+  `co64`) of any other track; otherwise refuse as a malformed timecode track.
+  Unusual timecode — counter mode (flag 0x8), negative (flag 0x4), a
+  description (timescale, frame duration, number of frames) that does not
+  match the video rate, or a frame number ≥ 2^31 — is not refused: the track
+  gets the timescale change only (its `stsd` and samples are untouched, so the
+  sample-offset rule above does not apply) and a warning says the timecode was
+  not converted and may read differently.
 - *Everything else* (text, metadata, chapters) — timescale change only.
 
 **Deliberately not touched:** codec-level timing hints (H.264/H.265 VUI
@@ -89,15 +107,26 @@ not silently patch essence.
 Not a MOV/MP4; no `moov`; fragmented (`moof`/`mvex`); compressed `moov`; no
 video track; video rate not exactly 24 or 25; non-constant sample durations;
 several video tracks with different rates; non-integer scaled timescale on a
-track; field overflow; drop-frame timecode; unsupported audio (anything but PCM); file not
-writable; truncated or malformed boxes (never panic, never read out of
-bounds — the parser is fed untrusted files).
+track; field overflow; drop-frame timecode; timecode samples outside `mdat`
+or overlapping another track's data (when they would be patched);
+unsupported audio (anything but PCM); not a regular file (checked before
+opening); file not writable (also in `--dry-run`); file locked by another
+process; truncated or malformed boxes (never panic, never read out of
+bounds — the parser is fed untrusted files). Malformed includes: a field that
+does not fit inside its own box; an entry count of `stco`, `co64`, `stsc`,
+`stsz`, `stts`, `ctts` or `elst` that does not fit its box; an `stsd` version
+other than 0 or 1; a chunk (offset plus its extent) outside the file.
 
 ## 6. Writing
 
 Open read-write, apply patches with positioned writes, `fsync`, close. Take an
 exclusive advisory lock for the duration. Total bytes written are in the tens.
-No temp file, no sidecar, no backup. Must work on SMB/NFS network volumes.
+No temp file, no sidecar, no backup. Must work on SMB/NFS network volumes:
+if the volume does not support locking (ENOTSUP/EOPNOTSUPP/ENOLCK), proceed
+without the lock and warn "could not lock file (not supported on this volume);
+proceeding without lock". A file locked by another process is refused.
+`--dry-run` opens and locks exactly like a real run but writes nothing, so it
+gives the same verdict.
 
 ## 7. CLI
 
@@ -108,10 +137,13 @@ No temp file, no sidecar, no backup. Must work on SMB/NFS network volumes.
     --json                        machine-readable output for all of the above
 
 Per file, print one line: `clip.mov: 25 → 24 fps, 312 frames, TC 01:00:00:00`
-plus any warnings. Always report the frame count; add a note when the count is
+plus any warnings (warnings also appear in `--json`). Always report the frame count; add a note when the count is
 not of the form 8n+1, since several video models require it (information only,
 never an error). Exit code 0 only if every file succeeded; process remaining
-files after a failure.
+files after a failure. A file given more than once (same device and inode,
+e.g. again or through a symlink) is processed once; later occurrences are
+reported as skipped ("duplicate of …") and are not failures. File names need
+not be UTF-8 (printed lossily, also in JSON).
 
 ## 8. Finder integration and distribution
 
@@ -140,4 +172,6 @@ files after a failure.
   24/1 or 25/1 (G5), start timecode label preserved, 25→24→25 SHA-256
   identical (G6).
 - Refusal tests: 23.976, 29.97, 30, VFR, fragmented MP4, truncated file,
-  read-only file, AAC audio — each leaves the SHA-256 unchanged (G3).
+  read-only file (also with `--dry-run`), AAC audio, hostile timecode chunk
+  offsets, short boxes, bad table counts — each leaves the SHA-256 unchanged
+  (G3).

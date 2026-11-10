@@ -3,6 +3,9 @@
 use fps_swap::atoms::fourcc;
 use fps_swap::conform::{frames, tc_label, video_rate};
 use fps_swap::{Movie, Target, conform_file, inspect};
+use std::collections::HashMap;
+use std::ffi::OsString;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -14,24 +17,20 @@ Conforms MOV/MP4 files between exactly 24 and 25 fps by rewriting container
 timing in place. Without --to, each file toggles (24 -> 25, 25 -> 24).";
 
 fn main() -> ExitCode {
-    let Ok(args) = std::env::args_os()
-        .skip(1)
-        .map(|a| a.into_string())
-        .collect::<Result<Vec<_>, _>>()
-    else {
-        return usage("arguments must be valid UTF-8");
-    };
-    let mut args = args.into_iter().peekable();
+    // File names need not be UTF-8: keep them as OsString, print them lossily.
+    let mut args = std::env::args_os().skip(1).peekable();
     let info = args.next_if(|a| a == "info").is_some();
-    let (mut target, mut dry_run, mut json, mut files) = (Target::Toggle, false, false, Vec::new());
+    let (mut target, mut dry_run, mut json) = (Target::Toggle, false, false);
+    let mut files: Vec<OsString> = Vec::new();
     let mut flags_done = false;
     while let Some(a) = args.next() {
-        match a.as_str() {
+        let s = a.to_str().unwrap_or("");
+        match s {
             _ if flags_done => files.push(a),
             "--" => flags_done = true,
             "--json" => json = true,
             "--dry-run" if !info => dry_run = true,
-            "--to" if !info => match args.next().as_deref() {
+            "--to" if !info => match args.next().as_ref().and_then(|a| a.to_str()) {
                 Some("24") => target = Target::To(24),
                 Some("25") => target = Target::To(25),
                 _ => return usage("--to takes 24 or 25"),
@@ -44,7 +43,7 @@ fn main() -> ExitCode {
                 println!("fps-swap {}", env!("CARGO_PKG_VERSION"));
                 return ExitCode::SUCCESS;
             }
-            _ if a.starts_with('-') && a.len() > 1 => return usage(&format!("unknown option {a}")),
+            _ if s.starts_with('-') && s.len() > 1 => return usage(&format!("unknown option {s}")),
             _ => files.push(a),
         }
     }
@@ -54,11 +53,31 @@ fn main() -> ExitCode {
 
     let mut ok = true;
     let mut out = Vec::new();
-    for file in &files {
+    // (device, inode) -> first name: the same file given twice must not toggle twice.
+    let mut seen: HashMap<(u64, u64), String> = HashMap::new();
+    for path in &files {
+        let file = &path.to_string_lossy();
+        let id = std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()));
+        if let Some(first) = id.and_then(|id| seen.get(&id)) {
+            let reason = format!("duplicate of {first}");
+            if json {
+                out.push(format!(
+                    "{{\"file\":{},\"ok\":true,\"skipped\":true,\"reason\":{}}}",
+                    q(file),
+                    q(&reason)
+                ));
+            } else {
+                println!("{file}: skipped: {reason}");
+            }
+            continue;
+        }
+        if let Some(id) = id {
+            seen.insert(id, file.to_string());
+        }
         let (good, line) = if info {
-            run_info(file, json)
+            run_info(Path::new(path), file, json)
         } else {
-            run_conform(file, target, dry_run, json)
+            run_conform(Path::new(path), file, target, dry_run, json)
         };
         ok &= good;
         if json {
@@ -91,8 +110,14 @@ fn note_8n1(file: &str, n: u64) {
 }
 
 /// Returns (success, JSON object). Text output is printed directly.
-fn run_conform(file: &str, target: Target, dry_run: bool, json: bool) -> (bool, String) {
-    let o = match conform_file(Path::new(file), target, dry_run) {
+fn run_conform(
+    path: &Path,
+    file: &str,
+    target: Target,
+    dry_run: bool,
+    json: bool,
+) -> (bool, String) {
+    let o = match conform_file(path, target, dry_run) {
         Ok(o) => o,
         Err(e) => return refused(file, &e.0, json),
     };
@@ -181,8 +206,8 @@ fn gcd(a: u64, b: u64) -> u64 {
     if b == 0 { a.max(1) } else { gcd(b, a % b) }
 }
 
-fn run_info(file: &str, json: bool) -> (bool, String) {
-    let m = match inspect(Path::new(file)) {
+fn run_info(path: &Path, file: &str, json: bool) -> (bool, String) {
+    let m = match inspect(path) {
         Ok(m) => m,
         Err(e) => return refused(file, &e.0, json),
     };

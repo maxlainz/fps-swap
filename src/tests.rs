@@ -43,6 +43,8 @@ struct T {
     sample_size: u32,
     /// Data of each sample; only used for `tmcd`.
     tc: Option<u32>,
+    /// Extra boxes appended to `stbl` (e.g. a `ctts`).
+    stbl_extra: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -98,6 +100,7 @@ fn video(ts: u64, delta: u32, n: u32) -> T {
         entry: video_entry(b"avc1"),
         sample_size: 1,
         tc: None,
+        stbl_extra: Vec::new(),
     }
 }
 
@@ -109,6 +112,7 @@ fn pcm(rate: u32, n: u32) -> T {
         entry: sound_entry(b"sowt", rate),
         sample_size: 1,
         tc: None,
+        stbl_extra: Vec::new(),
     }
 }
 
@@ -120,6 +124,7 @@ fn tmcd(fps: u32, frame: u32) -> T {
         entry: tmcd_entry(0, fps * 100, 100, fps as u8),
         sample_size: 4,
         tc: Some(frame),
+        stbl_extra: Vec::new(),
     }
 }
 
@@ -199,7 +204,7 @@ fn build_moov(m: &M, chunk_offs: &[u64]) -> Vec<u8> {
         } else {
             full(b"stco", 0, &[&u32b(1), &u32b(off)])
         };
-        let stbl = bx(b"stbl", &[&stsd, &stts, &stsc, &stsz, &stco]);
+        let stbl = bx(b"stbl", &[&stsd, &stts, &stsc, &stsz, &stco, &t.stbl_extra]);
         let dinf = bx(b"dinf", &[]);
         let minf = bx(b"minf", &[&dinf, &stbl]);
         let mdia = bx(b"mdia", &[&mdhd, &hdlr, &minf]);
@@ -448,9 +453,6 @@ fn audio_refusals() {
     let mut aac = pcm(48000, 10);
     aac.entry = sound_entry(b"mp4a", 48000);
     assert!(refusal(&build(&movie(vec![video(25, 1, 9), aac]))).contains("'mp4a'"));
-    let mut mismatch = pcm(48000, 10);
-    mismatch.entry = sound_entry(b"sowt", 44100);
-    assert!(refusal(&build(&movie(vec![video(25, 1, 9), mismatch]))).contains("does not match"));
     // 64800 * 25/24 = 67500 does not fit the 16.16 field.
     let big = pcm(64800, 10);
     assert!(refusal(&build(&movie(vec![video(24, 1, 9), big]))).contains("overflow"));
@@ -477,9 +479,9 @@ fn timecode_refusals() {
     let mut df = tmcd(25, 0);
     df.entry = tmcd_entry(1, 2500, 100, 25);
     assert!(refusal(&build(&movie(vec![video(25, 1, 9), df]))).contains("drop-frame"));
-    let mut other = tmcd(25, 0);
-    other.entry = tmcd_entry(0, 3000, 100, 30);
-    assert!(refusal(&build(&movie(vec![video(25, 1, 9), other]))).contains("timecode"));
+    let mut fmt = tmcd(25, 0);
+    fmt.entry = bx(b"xtcd", &[&tmcd_entry(0, 2500, 100, 25)[8..]]);
+    assert!(refusal(&build(&movie(vec![video(25, 1, 9), fmt]))).contains("timecode format"));
 }
 
 #[test]
@@ -497,6 +499,295 @@ fn patches_are_sorted_disjoint_and_fixed_width() {
     );
     assert!(p.patches.iter().all(|x| matches!(x.bytes.len(), 1 | 4 | 8)));
     assert!(p.patches.iter().map(|x| x.bytes.len()).sum::<usize>() < 100);
+}
+
+// ---------- hostile and unusual files (adversarial review) ----------
+
+/// Offset of the size field of the `n`-th (0-based) box of type `t`.
+fn box_at(b: &[u8], t: &[u8; 4], n: usize) -> usize {
+    b.windows(4)
+        .enumerate()
+        .filter(|(_, w)| w == t)
+        .nth(n)
+        .expect("box")
+        .0
+        - 4
+}
+
+fn get32(b: &[u8], off: usize) -> u32 {
+    u32::from_be_bytes(b[off..off + 4].try_into().unwrap())
+}
+
+fn set32(b: &mut [u8], off: usize, v: u32) {
+    b[off..off + 4].copy_from_slice(&v.to_be_bytes());
+}
+
+/// Shrink the first `t` box to `keep` payload bytes; the rest becomes a 'free' box.
+fn shrink(b: &mut [u8], t: &[u8; 4], keep: usize) {
+    let s = box_at(b, t, 0);
+    let old = get32(b, s) as usize;
+    set32(b, s, (8 + keep) as u32);
+    set32(b, s + 8 + keep, (old - 8 - keep) as u32);
+    b[s + 12 + keep..s + 16 + keep].copy_from_slice(b"free");
+}
+
+/// Offset of the first sample entry of the `n`-th track's `stsd`.
+fn entry_at(b: &[u8], n: usize) -> usize {
+    box_at(b, b"stsd", n) + 16
+}
+
+#[test]
+fn tmcd_samples_must_be_inside_mdat_and_clear_of_other_tracks() {
+    // Point 1: a hostile tmcd chunk offset must never steer the 4-byte patch
+    // into video essence (G1) or into moov.
+    let b = build(&movie(vec![video(25, 1, 9), tmcd(25, 90000)]));
+    let tc_stco = box_at(&b, b"stco", 1) + 16;
+    let video_chunk = get32(&b, box_at(&b, b"stco", 0) + 16);
+    let video_delta = box_at(&b, b"stts", 0) + 20;
+    for target in [video_chunk + 4, video_delta as u32] {
+        let mut h = b.clone();
+        set32(&mut h, tc_stco, target);
+        if target == video_chunk + 4 {
+            // Video bytes that read as a plausible frame number (else it is not converted).
+            set32(&mut h, target as usize, 90000);
+        }
+        let r = refusal(&h);
+        assert!(r.contains("malformed timecode track 2"), "{target}: {r}");
+        // Not converted (counter mode): offsets are irrelevant and nothing there is written.
+        let flags = entry_at(&h, 1) + 20;
+        set32(&mut h, flags, 0x8);
+        let p = plan_buf(&h, Target::Toggle).expect("counter mode is converted");
+        let out = apply(&h, &p);
+        let t = target as usize;
+        assert_eq!(out[t..t + 4], h[t..t + 4], "{target}");
+        assert_eq!(
+            out[video_delta..video_delta + 4],
+            h[video_delta..video_delta + 4]
+        );
+    }
+}
+
+#[test]
+fn fields_are_bounded_by_their_box() {
+    // Point 2: a short box must be refused, never read or patched past its end.
+    let b = build(&movie(vec![video(25, 1, 9), pcm(48000, 10)]));
+    for (t, keep) in [
+        (b"tkhd", 20),
+        (b"mvhd", 16),
+        (b"mvhd", 90), // timescale and duration fit, the QuickTime times do not
+        (b"mdhd", 16),
+        (b"stsz", 4),
+    ] {
+        let mut h = b.clone();
+        shrink(&mut h, t, keep);
+        let r = refusal(&h);
+        let want = format!("'{}' box too short", std::str::from_utf8(t).unwrap());
+        assert!(r.contains(&want), "{want}: {r}");
+    }
+}
+
+#[test]
+fn table_counts_versions_and_chunk_extents_are_validated() {
+    // Point 3.
+    let mut v = video(25, 1, 9);
+    v.stbl_extra = full(b"ctts", 0, &[&u32b(1), &u32b(9), &u32b(0)]);
+    let b = build(&movie(vec![v, pcm(48000, 10)]));
+    plan_buf(&b, Target::Toggle).expect("valid file");
+    for t in [b"stco", b"stsc", b"stts", b"ctts", b"elst", b"stsz"] {
+        let mut h = b.clone();
+        let s = box_at(&h, t, 0);
+        if t == b"stsz" {
+            set32(&mut h, s + 12, 0); // variable sizes: the count now needs a table
+            set32(&mut h, s + 16, 9);
+        } else {
+            set32(&mut h, s + 12, 0x1000_0000);
+        }
+        let r = refusal(&h);
+        let want = format!("'{}' entry count", std::str::from_utf8(t).unwrap());
+        assert!(r.contains(&want), "{want}: {r}");
+    }
+    let mut h = b.clone();
+    h[box_at(&b, b"stsd", 0) + 8] = 2;
+    assert!(refusal(&h).contains("unsupported 'stsd' version 2"));
+    // Video chunk (9 bytes) starting 2 bytes before the end of the file.
+    let mut h = b.clone();
+    let n = h.len() as u32;
+    set32(&mut h, box_at(&b, b"stco", 0) + 16, n - 2);
+    assert!(refusal(&h).contains("track 1 has data outside the file"));
+}
+
+#[test]
+fn pcm_rate_mismatch_only_rescales_with_warning() {
+    // Points 7 and 13. ISO ipcm at 96 kHz: 16.16 field says 48000, 'srat' says 96000.
+    let mut a = pcm(96000, 10);
+    let mut e = sound_entry(b"ipcm", 48000);
+    e.extend(full(b"srat", 0, &[&u32b(96000)]));
+    let len = e.len() as u32;
+    set32(&mut e, 0, len);
+    a.entry = e;
+    let mut qt = pcm(48000, 10);
+    qt.entry = sound_entry(b"sowt", 44100);
+    for (a, ts, why) in [
+        (
+            a,
+            92160,
+            "'srat' box, a sample description layout that is not supported",
+        ),
+        (
+            qt,
+            46080,
+            "declared sample rate does not match the media timescale",
+        ),
+    ] {
+        let b = build(&movie(vec![video(25, 1, 9), a]));
+        let p = plan_buf(&b, Target::Toggle).expect("PCM mismatch is converted");
+        assert_eq!(p.warnings.len(), 1, "{:?}", p.warnings);
+        assert!(p.warnings[0].contains(why), "{}", p.warnings[0]);
+        assert!(p.warnings[0].contains("audio sync is not guaranteed"));
+        let (orig, out) = (parse_buf(&b).unwrap(), parse_buf(&apply(&b, &p)).unwrap());
+        assert_eq!(out.tracks[1].timescale.value, ts);
+        assert_eq!(
+            out.tracks[1].entries[0].bytes,
+            orig.tracks[1].entries[0].bytes
+        );
+    }
+    // Compressed audio is still refused.
+    let mut aac = pcm(48000, 10);
+    aac.entry = sound_entry(b"mp4a", 44100);
+    assert!(refusal(&build(&movie(vec![video(25, 1, 9), aac]))).contains("'mp4a'"));
+}
+
+#[test]
+fn strategy_b_rescales_quicktime_mvhd_times() {
+    // Point 8: 24 fps, movie timescale 1000 forces Strategy B at 24 -> 25.
+    for v1 in [false, true] {
+        let mut m = movie(vec![video(24, 1, 17)]);
+        m.v1 = v1;
+        let mut b = build(&m);
+        let mv = parse_buf(&b).unwrap();
+        let first = box_at(&b, b"mvhd", 0) + 8 + if v1 { 84 } else { 72 };
+        assert_eq!(mv.mvhd_times[0].off as usize, first);
+        for (f, v) in mv.mvhd_times.iter().zip([240, 0, 480, 1000, 24, 7]) {
+            set32(&mut b, f.off as usize, v);
+        }
+        let p = plan_buf(&b, Target::Toggle).unwrap();
+        assert!(p.movie_rescaled);
+        let out = parse_buf(&apply(&b, &p)).unwrap();
+        let got: Vec<u64> = out.mvhd_times.iter().map(|f| f.value).collect();
+        // x 24/25, round half up; 0 stays 0.
+        assert_eq!(got, [230, 0, 461, 960, 23, 7]);
+    }
+}
+
+#[test]
+fn round_trip_with_movie_timescale_24_is_equivalent() {
+    // Point 9 / G6: 24 is not a multiple of 25, so 25 -> 24 uses Strategy B and
+    // 24 -> 25 Strategy A (24 * 25/24 = 25): not byte-identical, but equivalent.
+    let mut m = movie(vec![
+        video(12800, 512, 17),
+        pcm(48000, 100),
+        tmcd(25, 90000),
+    ]);
+    m.timescale = 24;
+    let b = build(&m);
+    let p1 = plan_buf(&b, Target::Toggle).unwrap();
+    assert!(p1.movie_rescaled);
+    let once = apply(&b, &p1);
+    let p2 = plan_buf(&once, Target::Toggle).unwrap();
+    assert!(!p2.movie_rescaled);
+    let back = apply(&once, &p2);
+    assert_eq!(back.len(), b.len());
+    let (o, r) = (parse_buf(&b).unwrap(), parse_buf(&back).unwrap());
+    for (a, z) in o.tracks.iter().zip(&r.tracks) {
+        assert_eq!(a.timescale.value, z.timescale.value);
+        assert_eq!(a.stts, z.stts);
+        assert_eq!(a.sample_count, z.sample_count);
+        assert_eq!(a.tc_samples, z.tc_samples);
+        let bytes = |t: &crate::atoms::Track| t.entries[0].bytes.clone();
+        assert_eq!(bytes(a), bytes(z));
+    }
+    let tick = 1.0 / o.timescale.value.min(r.timescale.value) as f64;
+    let secs = |f: &crate::atoms::Field, m: &Movie| f.value as f64 / m.timescale.value as f64;
+    let pairs = std::iter::once((&o.duration, &r.duration))
+        .chain(
+            o.tracks
+                .iter()
+                .zip(&r.tracks)
+                .map(|(a, z)| (&a.tkhd_duration, &z.tkhd_duration)),
+        )
+        .chain(
+            o.tracks
+                .iter()
+                .zip(&r.tracks)
+                .map(|(a, z)| (&a.elst[0], &z.elst[0])),
+        );
+    for (a, z) in pairs {
+        assert!((secs(a, &o) - secs(z, &r)).abs() <= tick, "{a:?} vs {z:?}");
+    }
+}
+
+#[test]
+fn lock_unsupported_volume_warns_but_held_lock_refuses() {
+    // Point 11. The real ENOTSUP path needs a volume without flock support.
+    use std::fs::TryLockError;
+    use std::io::Error;
+    #[cfg(target_os = "linux")]
+    let unsupported = [95, 37];
+    #[cfg(not(target_os = "linux"))]
+    let unsupported = [45, 102, 77];
+    for code in unsupported {
+        let w = crate::lock_outcome(Err(TryLockError::Error(Error::from_raw_os_error(code))))
+            .expect("proceeds")
+            .expect("warns");
+        assert!(w.contains("not supported on this volume"), "{w}");
+    }
+    assert_eq!(crate::lock_outcome(Ok(())), Ok(None));
+    let held = crate::lock_outcome(Err(TryLockError::WouldBlock)).unwrap_err();
+    assert!(held.0.contains("locked by another process"));
+    let other = crate::lock_outcome(Err(TryLockError::Error(Error::from_raw_os_error(9))));
+    assert!(other.unwrap_err().0.contains("cannot lock file"));
+}
+
+#[test]
+fn unusual_timecode_gets_timescale_only_with_warning() {
+    // Point 12.
+    let with = |entry: Vec<u8>, ts: u64, frame: u32| {
+        let mut t = tmcd(25, frame);
+        (t.entry, t.timescale) = (entry, ts);
+        t
+    };
+    for (t, why) in [
+        (
+            with(tmcd_entry(0x8, 2500, 100, 25), 2500, 0),
+            "counter mode",
+        ),
+        (
+            with(tmcd_entry(0x4, 2500, 100, 25), 2500, 25),
+            "negative timecode",
+        ),
+        (
+            with(tmcd_entry(0, 3000, 100, 30), 3000, 108000),
+            "3000/100 with 30 frames does not match 25 fps",
+        ),
+        (tmcd(25, 1 << 31), "2^31"),
+    ] {
+        let b = build(&movie(vec![video(25, 1, 9), t]));
+        let p = plan_buf(&b, Target::Toggle).expect(why);
+        assert_eq!(p.warnings.len(), 1, "{why}: {:?}", p.warnings);
+        assert!(p.warnings[0].contains(why) && p.warnings[0].contains("not converted"));
+        assert!(p.tc_before.is_none());
+        let (orig, out) = (parse_buf(&b).unwrap(), parse_buf(&apply(&b, &p)).unwrap());
+        let (a, z) = (&orig.tracks[1], &out.tracks[1]);
+        assert_eq!(z.timescale.value, a.timescale.value * 24 / 25, "{why}");
+        assert_eq!(
+            z.entries[0].bytes, a.entries[0].bytes,
+            "{why}: stsd untouched"
+        );
+        assert_eq!(z.tc_samples, a.tc_samples, "{why}: samples untouched");
+    }
+    // The track timescale must still scale exactly.
+    let t = with(tmcd_entry(0x8, 2501, 100, 25), 2501, 0);
+    assert!(refusal(&build(&movie(vec![video(25, 1, 9), t]))).contains("cannot be scaled"));
 }
 
 // ---------- property tests ----------

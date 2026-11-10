@@ -36,6 +36,10 @@ pub struct Outcome {
 }
 
 fn open(path: &Path, write: bool) -> Result<File, Refusal> {
+    // Checked before opening: opening a FIFO would block.
+    if std::fs::metadata(path).is_ok_and(|m| !m.is_file()) {
+        return Err(Refusal("not a regular file".into()));
+    }
     OpenOptions::new()
         .read(true)
         .write(write)
@@ -57,21 +61,15 @@ pub fn inspect(path: &Path) -> Result<Movie, Refusal> {
 
 /// Conform one file. Every check runs and every patch is computed before the
 /// first byte is written (G3); only fixed-width fields are overwritten (G2).
+/// A dry run opens and locks the file exactly like a real run (writing nothing),
+/// so it reaches the same verdict.
 pub fn conform_file(path: &Path, target: Target, dry_run: bool) -> Result<Outcome, Refusal> {
-    let mut f = open(path, !dry_run)?;
-    if !dry_run {
-        match f.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => {
-                return Err(Refusal("file is locked by another process".into()));
-            }
-            // shortcut: volumes without flock support are refused; revisit if NFS users need it.
-            Err(TryLockError::Error(e)) => return Err(Refusal(format!("cannot lock file: {e}"))),
-        }
-    }
+    let mut f = open(path, true)?;
+    let lock_warning = lock_outcome(f.try_lock())?;
     let len = f.metadata().map_err(|e| Refusal(e.to_string()))?.len();
     let movie = parse(&mut f, len)?;
-    let plan = plan(&movie, target)?;
+    let mut plan = plan(&movie, target)?;
+    plan.warnings.extend(lock_warning);
     if dry_run || plan.patches.is_empty() {
         return Ok(Outcome {
             plan,
@@ -83,6 +81,32 @@ pub fn conform_file(path: &Path, target: Target, dry_run: bool) -> Result<Outcom
         plan,
         bytes_written,
     })
+}
+
+/// errno values meaning "this volume cannot lock", not "someone holds the lock".
+#[cfg(target_os = "linux")]
+const NO_LOCK_SUPPORT: [i32; 2] = [95, 37]; // EOPNOTSUPP (= ENOTSUP), ENOLCK
+#[cfg(not(target_os = "linux"))]
+const NO_LOCK_SUPPORT: [i32; 3] = [45, 102, 77]; // ENOTSUP, EOPNOTSUPP, ENOLCK
+
+/// SPEC §6: a file locked by another process is refused; a volume that does not
+/// support locking gets a warning and the conform proceeds without the lock.
+pub(crate) fn lock_outcome(r: Result<(), TryLockError>) -> Result<Option<String>, Refusal> {
+    match r {
+        Ok(()) => Ok(None),
+        Err(TryLockError::WouldBlock) => Err(Refusal("file is locked by another process".into())),
+        Err(TryLockError::Error(e))
+            if e.kind() == ErrorKind::Unsupported
+                || e.raw_os_error()
+                    .is_some_and(|c| NO_LOCK_SUPPORT.contains(&c)) =>
+        {
+            Ok(Some(
+                "could not lock file (not supported on this volume); proceeding without lock"
+                    .into(),
+            ))
+        }
+        Err(TryLockError::Error(e)) => Err(Refusal(format!("cannot lock file: {e}"))),
+    }
 }
 
 fn write_patches(f: &File, plan: &Plan) -> Result<usize, Refusal> {

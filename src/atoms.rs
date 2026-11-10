@@ -49,6 +49,9 @@ pub struct Track {
     pub entries: Vec<Entry>,
     /// Timecode tracks only: (absolute offset, frame number) of each sample.
     pub tc_samples: Vec<(u64, u32)>,
+    /// Timecode tracks only: every chunk lies inside a top-level `mdat` payload
+    /// and overlaps no other track's chunk, so its samples may be patched (G1).
+    pub tc_safe: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -56,6 +59,9 @@ pub struct Movie {
     pub file_len: u64,
     pub timescale: Field,
     pub duration: Field,
+    /// QuickTime `mvhd` preview time, preview duration, poster time, selection
+    /// time, selection duration and current time (movie timescale; zero in ISO files).
+    pub mvhd_times: Vec<Field>,
     pub tracks: Vec<Track>,
 }
 
@@ -157,13 +163,27 @@ pub fn fourcc(t: &[u8; 4]) -> String {
         .collect()
 }
 
-/// Read a field of `width` bytes at `buf[off]`, which lives at file offset `base + off`.
-fn field(buf: &[u8], base: u64, off: usize, width: u8, what: &str) -> Result<Field, Refusal> {
+/// The bytes of `buf` up to the end of box `b`: reads through this never leave the box.
+fn upto<'a>(buf: &'a [u8], b: &BoxRef) -> &'a [u8] {
+    &buf[..b.end]
+}
+
+/// Read a field of `width` bytes at payload offset `rel` of box `b`; `buf[i]` lives at
+/// file offset `base + i`. A field that does not fit inside the box is a refusal.
+fn field(
+    buf: &[u8],
+    base: u64,
+    b: &BoxRef,
+    rel: usize,
+    width: u8,
+    what: &str,
+) -> Result<Field, Refusal> {
+    let (buf, off) = (upto(buf, b), b.body + rel);
     let value = match width {
         4 => be32(buf, off).map(u64::from),
         _ => be64(buf, off),
     }
-    .ok_or_else(|| bad(what))?;
+    .ok_or_else(|| bad(&format!("'{what}' box too short")))?;
     Ok(Field {
         off: base + off as u64,
         width,
@@ -173,7 +193,7 @@ fn field(buf: &[u8], base: u64, off: usize, width: u8, what: &str) -> Result<Fie
 
 /// Full-box version byte; only 0 and 1 are defined for the boxes we patch.
 fn version(buf: &[u8], b: &BoxRef, what: &str) -> Result<u8, Refusal> {
-    match buf.get(b.body) {
+    match upto(buf, b).get(b.body) {
         Some(v @ (0 | 1)) => Ok(*v),
         Some(v) => Err(Refusal(format!("unsupported '{what}' version {v}"))),
         None => Err(bad(what)),
@@ -193,6 +213,7 @@ fn read_at<R: Read + Seek>(r: &mut R, off: u64, n: usize) -> Result<Vec<u8>, Ref
 pub fn parse<R: Read + Seek>(r: &mut R, file_len: u64) -> Result<Movie, Refusal> {
     let mut pos = 0u64;
     let mut moov: Option<(u64, u64)> = None;
+    let mut mdats = Vec::new();
     let mut first = true;
     while pos < file_len {
         let n = (file_len - pos).min(16) as usize;
@@ -220,6 +241,7 @@ pub fn parse<R: Read + Seek>(r: &mut R, file_len: u64) -> Result<Movie, Refusal>
             b"moof" | b"mfra" => return Err(Refusal("fragmented MP4 is not supported".into())),
             b"moov" if moov.is_some() => return Err(bad("more than one 'moov'")),
             b"moov" => moov = Some((pos + hdr, end)),
+            b"mdat" => mdats.push((pos + hdr, end)),
             _ => {}
         }
         pos = end;
@@ -230,13 +252,14 @@ pub fn parse<R: Read + Seek>(r: &mut R, file_len: u64) -> Result<Movie, Refusal>
     }
     // Load the moov payload; offsets inside `buf` map to file offset `body + i`.
     let buf = read_at(r, body, (end - body) as usize)?;
-    parse_moov(&buf, body, file_len, r)
+    parse_moov(&buf, body, file_len, &mdats, r)
 }
 
 fn parse_moov<R: Read + Seek>(
     buf: &[u8],
     base: u64,
     file_len: u64,
+    mdats: &[(u64, u64)],
     r: &mut R,
 ) -> Result<Movie, Refusal> {
     let kids = children(buf, 0, buf.len())?;
@@ -249,21 +272,63 @@ fn parse_moov<R: Read + Seek>(
     let mvhd = need(&kids, b"mvhd", "moov")?;
     let v = version(buf, mvhd, "mvhd")?;
     let (ts_off, w) = if v == 1 { (20, 8) } else { (12, 4) };
-    let timescale = field(buf, base, mvhd.body + ts_off, 4, "mvhd")?;
-    let duration = field(buf, base, mvhd.body + ts_off + 4, w, "mvhd")?;
+    let timescale = field(buf, base, mvhd, ts_off, 4, "mvhd")?;
+    let duration = field(buf, base, mvhd, ts_off + 4, w, "mvhd")?;
     if timescale.value == 0 {
         return Err(bad("movie timescale is zero"));
     }
-    let tracks = kids
+    // After duration: rate (4), volume (2), reserved (10), matrix (36), then six times.
+    let times_off = ts_off + 4 + usize::from(w) + 52;
+    let mvhd_times = (0..6)
+        .map(|i| field(buf, base, mvhd, times_off + 4 * i, 4, "mvhd"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let (mut tracks, chunks): (Vec<Track>, Vec<Vec<(u64, u64)>>) = kids
         .iter()
         .filter(|b| &b.typ == b"trak")
         .map(|t| parse_trak(buf, base, t, file_len, r))
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .unzip();
+    for (i, t) in tracks.iter_mut().enumerate() {
+        if &t.handler == b"tmcd" {
+            t.tc_safe = tc_chunks_safe(i, &chunks, mdats);
+        }
+    }
     Ok(Movie {
         file_len,
         timescale,
         duration,
+        mvhd_times,
         tracks,
+    })
+}
+
+/// True when every non-empty chunk of track `i` sits inside one top-level `mdat`
+/// payload and overlaps no non-empty chunk of any other track.
+fn tc_chunks_safe(i: usize, chunks: &[Vec<(u64, u64)>], mdats: &[(u64, u64)]) -> bool {
+    // Other tracks' extents sorted by start, with the running maximum of their ends.
+    let mut others: Vec<(u64, u64)> = chunks
+        .iter()
+        .enumerate()
+        .filter(|&(j, _)| j != i)
+        .flat_map(|(_, c)| c.iter().filter(|c| c.1 > 0).map(|&(o, l)| (o, o + l)))
+        .collect();
+    others.sort_unstable();
+    let mut max_end = 0;
+    let max_ends: Vec<u64> = others
+        .iter()
+        .map(|&(_, e)| {
+            max_end = max_end.max(e);
+            max_end
+        })
+        .collect();
+    chunks[i].iter().filter(|c| c.1 > 0).all(|&(off, len)| {
+        // Extents were checked against the file length, so this cannot overflow.
+        let end = off + len;
+        let in_mdat = mdats.iter().any(|&(s, e)| s <= off && end <= e);
+        // Every other extent starting before `end`; one of them overlaps iff its end > off.
+        let n = others.partition_point(|&(s, _)| s < end);
+        in_mdat && (n == 0 || max_ends[n - 1] <= off)
     })
 }
 
@@ -273,29 +338,24 @@ fn parse_trak<R: Read + Seek>(
     trak: &BoxRef,
     file_len: u64,
     r: &mut R,
-) -> Result<Track, Refusal> {
+) -> Result<(Track, Vec<(u64, u64)>), Refusal> {
     let kids = children(buf, trak.body, trak.end)?;
     let tkhd = need(&kids, b"tkhd", "trak")?;
     let v = version(buf, tkhd, "tkhd")?;
     let (id_off, w) = if v == 1 { (20, 8) } else { (12, 4) };
-    let id = be32(buf, tkhd.body + id_off).ok_or_else(|| bad("tkhd"))?;
+    let id = field(buf, base, tkhd, id_off, 4, "tkhd")?.value as u32;
     // track_ID is followed by 4 reserved bytes, then duration.
-    let tkhd_duration = field(buf, base, tkhd.body + id_off + 8, w, "tkhd")?;
+    let tkhd_duration = field(buf, base, tkhd, id_off + 8, w, "tkhd")?;
 
     let mut elst = Vec::new();
     if let Some(edts) = find(&kids, b"edts") {
         let ek = children(buf, edts.body, edts.end)?;
         if let Some(e) = find(&ek, b"elst") {
             let v = version(buf, e, "elst")?;
-            let n = be32(buf, e.body + 4).ok_or_else(|| bad("elst"))? as usize;
             let (step, w) = if v == 1 { (20, 8) } else { (12, 4) };
-            if n.checked_mul(step)
-                .is_none_or(|len| e.body + 8 + len > e.end)
-            {
-                return Err(bad("elst entry count"));
-            }
+            let n = table(buf, e, step)?.len();
             for i in 0..n {
-                elst.push(field(buf, base, e.body + 8 + i * step, w, "elst")?);
+                elst.push(field(buf, base, e, 8 + i * step, w, "elst")?);
             }
         }
     }
@@ -305,8 +365,8 @@ fn parse_trak<R: Read + Seek>(
     let mdhd = need(&mk, b"mdhd", "mdia")?;
     let v = version(buf, mdhd, "mdhd")?;
     let (ts_off, w) = if v == 1 { (20, 8) } else { (12, 4) };
-    let timescale = field(buf, base, mdhd.body + ts_off, 4, "mdhd")?;
-    let media_duration = field(buf, base, mdhd.body + ts_off + 4, w, "mdhd")?.value;
+    let timescale = field(buf, base, mdhd, ts_off, 4, "mdhd")?;
+    let media_duration = field(buf, base, mdhd, ts_off + 4, w, "mdhd")?.value;
     if timescale.value == 0 {
         return Err(bad("media timescale is zero"));
     }
@@ -324,7 +384,8 @@ fn parse_trak<R: Read + Seek>(
 
     // stsd: version/flags, count, then sample entries shaped like boxes.
     let stsd = need(&sk, b"stsd", "stbl")?;
-    let n = be32(buf, stsd.body + 4).ok_or_else(|| bad("stsd"))?;
+    version(buf, stsd, "stsd")?;
+    let n = field(buf, base, stsd, 4, 4, "stsd")?.value;
     let ents = children(buf, (stsd.body + 8).min(stsd.end), stsd.end)?;
     if ents.len() != n as usize || n == 0 {
         return Err(bad("stsd entry count"));
@@ -339,11 +400,9 @@ fn parse_trak<R: Read + Seek>(
         .collect();
 
     let stts_b = need(&sk, b"stts", "stbl")?;
-    let n = be32(buf, stts_b.body + 4).ok_or_else(|| bad("stts"))? as usize;
-    if n.checked_mul(8)
-        .is_none_or(|len| stts_b.body + 8 + len > stts_b.end)
-    {
-        return Err(bad("stts entry count"));
+    let n = table(buf, stts_b, 8)?.len();
+    if let Some(ctts) = find(&sk, b"ctts") {
+        table(buf, ctts, 8)?;
     }
     let stts = (0..n)
         .map(|i| {
@@ -353,28 +412,47 @@ fn parse_trak<R: Read + Seek>(
         .collect();
 
     let stsz = need(&sk, b"stsz", "stbl")?;
-    let fixed_size = be32(buf, stsz.body + 4).ok_or_else(|| bad("stsz"))?;
-    let sample_count = be32(buf, stsz.body + 8).ok_or_else(|| bad("stsz"))?;
+    let fixed_size = field(buf, base, stsz, 4, 4, "stsz")?.value as u32;
+    let sample_count = field(buf, base, stsz, 8, 4, "stsz")?.value as u32;
     if fixed_size == 0
         && (sample_count as usize)
             .checked_mul(4)
             .is_none_or(|len| stsz.body + 12 + len > stsz.end)
     {
-        return Err(bad("stsz entry count"));
+        return Err(bad("'stsz' entry count"));
     }
 
+    let is_tc = &handler == b"tmcd";
+    if is_tc && sample_count as usize > MAX_TC_SAMPLES {
+        return Err(Refusal("too many timecode samples".into()));
+    }
+    let mut samples = Vec::new();
+    let chunks = chunk_extents(
+        buf,
+        &sk,
+        stsz,
+        fixed_size,
+        sample_count,
+        is_tc.then_some(&mut samples),
+    )?;
+    if chunks
+        .iter()
+        .any(|&(off, len)| off.checked_add(len).is_none_or(|e| e > file_len))
+    {
+        return Err(Refusal(format!(
+            "truncated or malformed file: track {id} has data outside the file"
+        )));
+    }
     let mut tc_samples = Vec::new();
-    if &handler == b"tmcd" {
-        for (off, size) in sample_offsets(buf, &sk, stsz, fixed_size, sample_count)? {
-            if size < 4 || off.checked_add(4).is_none_or(|e| e > file_len) {
-                return Err(bad("timecode sample outside the file"));
-            }
-            let b = read_at(r, off, 4)?;
-            tc_samples.push((off, be32(&b, 0).expect("4 bytes")));
+    for (off, size) in samples {
+        if size < 4 {
+            return Err(bad("timecode sample shorter than 4 bytes"));
         }
+        let b = read_at(r, off, 4)?;
+        tc_samples.push((off, be32(&b, 0).expect("4 bytes")));
     }
 
-    Ok(Track {
+    let track = Track {
         id,
         handler,
         tkhd_duration,
@@ -385,64 +463,79 @@ fn parse_trak<R: Read + Seek>(
         sample_count,
         entries,
         tc_samples,
-    })
+        tc_safe: false,
+    };
+    Ok((track, chunks))
 }
 
-/// File offsets of every sample (used for the few samples of a `tmcd` track).
-fn sample_offsets(
+/// Extent (file offset, byte length) of every chunk, from `stsc`, `stsz` and
+/// `stco`/`co64`, with checked arithmetic. If `samples` is given, it also receives
+/// the (offset, size) of every sample (used for the few samples of a `tmcd` track).
+fn chunk_extents(
     buf: &[u8],
     sk: &[BoxRef],
     stsz: &BoxRef,
     fixed_size: u32,
     count: u32,
-) -> Result<Vec<(u64, u32)>, Refusal> {
-    let count = count as usize;
-    if count > MAX_TC_SAMPLES {
-        return Err(Refusal("too many timecode samples".into()));
-    }
-    let chunks: Vec<u64> = if let Some(c) = find(sk, b"stco") {
-        table(buf, c, 4)?
-    } else if let Some(c) = find(sk, b"co64") {
-        table(buf, c, 8)?
-    } else {
-        return Err(bad("no chunk offset table"));
+    mut samples: Option<&mut Vec<(u64, u32)>>,
+) -> Result<Vec<(u64, u64)>, Refusal> {
+    let offsets: Vec<u64> = match (find(sk, b"stco"), find(sk, b"co64")) {
+        (Some(c), _) => table(buf, c, 4)?,
+        (None, Some(c)) => table(buf, c, 8)?,
+        (None, None) => Vec::new(),
     };
-    let stsc = need(sk, b"stsc", "stbl")?;
-    let rows: Vec<u64> = table(buf, stsc, 12)?;
-    let n = rows.len();
-    let row = |i: usize, k: usize| be32(buf, stsc.body + 8 + i * 12 + k * 4).unwrap_or(0) as usize;
-    let mut out = Vec::with_capacity(count);
+    let stsc = find(sk, b"stsc");
+    let n = stsc
+        .map(|b| table(buf, b, 12))
+        .transpose()?
+        .map_or(0, |t| t.len());
+    let row = |i: usize, k: usize| {
+        stsc.and_then(|b| be32(upto(buf, b), b.body + 8 + i * 12 + k * 4))
+            .unwrap_or(0) as usize
+    };
+    let short = || bad("sample table does not cover every sample");
+    let size_of = |i: usize| {
+        if fixed_size != 0 {
+            Some(fixed_size)
+        } else {
+            be32(upto(buf, stsz), stsz.body + 12 + i * 4)
+        }
+    };
+    let count = count as usize;
+    let mut done = 0usize;
+    let mut out = Vec::with_capacity(offsets.len());
     for i in 0..n {
         let first = row(i, 0);
         let next = if i + 1 < n {
             row(i + 1, 0)
         } else {
-            chunks.len() + 1
+            offsets.len() + 1
         };
-        let per = row(i, 1);
-        if first == 0 || next < first || next > chunks.len() + 1 {
+        if first == 0 || next < first || next > offsets.len() + 1 {
             return Err(bad("stsc"));
         }
-        for &chunk_off in &chunks[first - 1..next - 1] {
-            let mut off = chunk_off;
-            for _ in 0..per {
-                if out.len() == count {
-                    return Ok(out);
+        for &chunk_off in &offsets[first - 1..next - 1] {
+            // Samples in this chunk; chunks past the last sample are empty.
+            let take = row(i, 1).min(count - done);
+            let len = if fixed_size != 0 && samples.is_none() {
+                u64::from(fixed_size) * take as u64
+            } else {
+                let mut len = 0u64;
+                for k in done..done + take {
+                    let size = size_of(k).ok_or_else(short)?;
+                    if let Some(s) = samples.as_deref_mut() {
+                        s.push((chunk_off.checked_add(len).ok_or_else(|| bad("stco"))?, size));
+                    }
+                    len += u64::from(size);
                 }
-                let size = if fixed_size != 0 {
-                    fixed_size
-                } else {
-                    be32(buf, stsz.body + 12 + out.len() * 4).ok_or_else(|| bad("stsz"))?
-                };
-                out.push((off, size));
-                off = off
-                    .checked_add(u64::from(size))
-                    .ok_or_else(|| bad("stsz"))?;
-            }
+                len
+            };
+            out.push((chunk_off, len));
+            done += take;
         }
     }
-    if out.len() != count {
-        return Err(bad("sample table does not cover every sample"));
+    if done != count {
+        return Err(short());
     }
     Ok(out)
 }
@@ -450,7 +543,9 @@ fn sample_offsets(
 /// A full box holding a 32-bit count and `count` rows of `row` bytes.
 /// For 4/8-byte rows the values are returned; for other widths only the count matters.
 fn table(buf: &[u8], b: &BoxRef, row: usize) -> Result<Vec<u64>, Refusal> {
-    let n = be32(buf, b.body + 4).ok_or_else(|| bad("table"))? as usize;
+    let buf = upto(buf, b);
+    let n = be32(buf, b.body + 4)
+        .ok_or_else(|| bad(&format!("'{}' box too short", fourcc(&b.typ))))? as usize;
     if n.checked_mul(row)
         .is_none_or(|len| b.body + 8 + len > b.end)
     {
