@@ -1,0 +1,18 @@
+[package]
+name = "fps-swap"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Lossless, in-place 24 <-> 25 fps conform for QuickTime/MP4 files"
+license = "MIT"
+publish = false
+
+[dependencies]
+
+[dev-dependencies]
+proptest = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

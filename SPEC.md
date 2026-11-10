@@ -65,10 +65,10 @@ If any *track* `mdhd.timescale × r` is not an integer, refuse.
 - *Audio* — relabel the sample rate. Patch the sample rate in the sound sample
   description (`stsd`) to match the new media timescale (48000 → 46080 at
   25→24, 48000 → 50000 at 24→25). Audio data is untouched; pitch shifts ±4 %
-  and sync is exact. PCM is the supported case. For compressed audio (AAC),
-  investigate what ffmpeg and AVFoundation do when the container rate differs
-  from the codec config; if playback is not reliably in sync, refuse files
-  with compressed audio with a clear message rather than ship a guess.
+  and sync is exact. PCM is the only supported case. Compressed audio (AAC
+  and any other non-PCM codec) is refused: ffmpeg and AVFoundation decode at
+  the rate in the codec config, not the container, so the audio would drift
+  out of sync (measured in `docs/FINDINGS.md` §1).
   Refuse if the new rate is not an integer or does not fit the field.
 - *Timecode (`tmcd`)* — keep the start timecode label. Patch the `tmcd` sample
   description (timescale, frame duration, number of frames) and the 32-bit
@@ -89,7 +89,7 @@ not silently patch essence.
 Not a MOV/MP4; no `moov`; fragmented (`moof`/`mvex`); compressed `moov`; no
 video track; video rate not exactly 24 or 25; non-constant sample durations;
 several video tracks with different rates; non-integer scaled timescale on a
-track; field overflow; drop-frame timecode; unsupported audio; file not
+track; field overflow; drop-frame timecode; unsupported audio (anything but PCM); file not
 writable; truncated or malformed boxes (never panic, never read out of
 bounds — the parser is fed untrusted files).
 
@@ -133,10 +133,11 @@ files after a failure.
   ±1 tick; no input bytes ever make the parser panic.
 - Integration tests on fixtures generated at test time with ffmpeg (skip with
   a clear message if ffmpeg is absent): ProRes/H.264/H.265 × 24/25 fps ×
-  {no audio, PCM, AAC} × {with, without timecode}, `moov` at front and at end.
+  {no audio, PCM} × {with, without timecode}, `moov` at front and at end.
+  The same matrix with AAC audio is a refusal test (see §4).
   For each: packet hash of the video stream identical (G1), file size
   identical (G2), ffprobe frame count identical (G4), ffprobe rate exactly
   24/1 or 25/1 (G5), start timecode label preserved, 25→24→25 SHA-256
   identical (G6).
 - Refusal tests: 23.976, 29.97, 30, VFR, fragmented MP4, truncated file,
-  read-only file — each leaves the SHA-256 unchanged (G3).
+  read-only file, AAC audio — each leaves the SHA-256 unchanged (G3).
