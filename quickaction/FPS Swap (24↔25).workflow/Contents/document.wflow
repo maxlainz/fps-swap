@@ -77,11 +77,11 @@ fi
 
 for f in "$@"; do
   name=${f##*/}
-  if out=$("$BIN" "$f" 2&gt;&amp;1); then prefix=""; else prefix="Refused: "; fi
+  out=$("$BIN" "$f" 2&gt;&amp;1)
   out=${out//"$f: "/}
   out=${out//"$name: "/}
   msg=$(printf '%s' "$out" | tr '\n' ' ')
-  notify "$name" "$prefix${msg:-done}"
+  notify "$name" "${msg:-done}"
 done
 exit 0
 </string>
