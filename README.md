@@ -15,3 +15,37 @@ every frame is kept, only the playback rate changes. Run it before the model
 - **Right-click**: ships with a Finder Quick Action.
 
 Status: under construction. See [SPEC.md](SPEC.md) for the design contract.
+
+## Install
+
+Download the latest `fps-swap-*-macos-universal.zip` from
+[Releases](../../releases), unzip it and run:
+
+    ./install.sh
+
+This installs, for the current user and without sudo, the binary to
+`~/.local/bin/fps-swap` and the Quick Action to `~/Library/Services/`, and
+clears the download quarantine. `./uninstall.sh` removes both.
+
+From a checkout: `cargo build --release && ./install.sh`.
+
+### Install / update (internal)
+
+To install or update to the latest release in one step (downloads the
+release zip and runs its `install.sh`):
+
+    curl -fsSL https://raw.githubusercontent.com/maxlainz/fps-swap/main/update.sh | bash
+
+## Use
+
+**Finder**: select one or more movie files, right-click › Quick Actions ›
+**FPS Swap (24↔25)**. Each file is toggled and you get a notification with the
+direction and frame count, or the reason it was refused (refused files are left
+untouched).
+
+**Terminal**:
+
+    fps-swap clip.mov              # toggle: 25 → 24 or 24 → 25
+    fps-swap --to 24 *.mov         # explicit target; no-op if already 24
+    fps-swap --dry-run clip.mov    # show what would change, write nothing
+    fps-swap info clip.mov         # fps, frames, duration, tracks, timecode
