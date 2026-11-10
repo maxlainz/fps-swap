@@ -96,10 +96,35 @@ c2.mov: warning: timecode 10:00:00:24 has frame 24, which does not exist at 24 f
 ffprobe stream_tags=timecode → 10:00:00:23
 ```
 
-Pending owner confirmation.
+Confirmed by the owner (2026-11-10): clamp to :23 with a warning.
+
+## 4. Owner decisions (2026-11-10)
+
+a. **Locking.** A volume that does not support `flock` (ENOTSUP/EOPNOTSUPP/ENOLCK): proceed without the lock and warn. A file locked by another process: refuse.
+b. **Unusual timecode.** Counter mode, negative, a description that does not match the video rate, or a frame number ≥ 2^31: the file is converted, the `tmcd` track gets the timescale change only, and a warning is printed. Drop-frame is still refused.
+c. **PCM rate mismatch.** PCM whose declared rate does not match the track timescale (including `ipcm` with an `srat` box): timescale change only, with a warning that sync is not guaranteed. Compressed audio is still refused.
+
+(b) and (c) were not validated in Resolve or QuickTime.
+
+## 5. Adversarial review
+
+An independent reviewer ran 58,800 `moov` mutations over 15 fixtures, 52 targeted malformed cases, and a round trip on 35 ffmpeg variants.
+
+Two bugs broke guarantees, both only with hostile files. Both are fixed:
+
+1. Unvalidated `tmcd` sample offsets let the tool patch 4 bytes inside the video essence or inside `moov`. Now every timecode chunk must lie inside an `mdat` payload and overlap no chunk of any other track.
+2. Field reads were not bounded to their box: a short `tkhd` made the tool patch the header of the next box. Reads are now bounded; a short box is a refusal.
+
+Minor issues fixed: table entry counts, `stsd` version and chunk extents are validated; `--dry-run` gives the same verdict as a real run; arguments that are the same file (same dev/inode) are skipped; non-regular files are refused; G6 wording corrected (byte-identical only when every timescale is a multiple of 25).
+
+After the fixes: fuzzer, 22,400 iterations over 8 fixtures: 0 crashes, 0 files modified after a refusal, 0 size changes, 0 video hash changes.
+
+Not fixed on purpose: a 50 MB file made only of 8-byte boxes takes ~3.9 s (one read per top-level box).
+
+Known risk: chunk-extent validation applies to every track, so reference movies with external data (`dref`) are refused.
 
 ## Other checks
 
 Advisory lock: while another process held `flock(LOCK_EX)`, `fps-swap lk.mov` exited 1 with `refused: file is locked by another process` and the SHA-256 was unchanged. Without the lock it succeeded.
 
-Not tested: DaVinci Resolve, SMB/NFS volumes, real camera files.
+Not tested: DaVinci Resolve, SMB/NFS volumes, the real lock-not-supported path (unit test only), the Finder Quick Action, the universal binary, real camera files.
