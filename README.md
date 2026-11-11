@@ -53,7 +53,7 @@ Refused, with a one-line reason and the file left untouched:
 1. Download `fps-swap-<version>-macos-universal.zip` from the [latest release](https://github.com/maxlainz/fps-swap/releases/latest) and unzip it.
 2. In Terminal, from the unzipped folder, run `./install.sh`.
 
-No sudo is needed. The script installs the binary to `~/.local/bin/fps-swap` and the Quick Action to `~/Library/Services/`. The binary is not signed or notarized, so `install.sh` removes the download quarantine from the installed copies. If `~/.local/bin` is not in your `PATH`, the script prints the line to add to `~/.zshrc`.
+No sudo is needed. The script installs the binary to `~/.local/bin/fps-swap` and the two Quick Actions to `~/Library/Services/`. The binary is not signed or notarized, so `install.sh` removes the download quarantine from the installed copies. If `~/.local/bin` is not in your `PATH`, the script prints the line to add to `~/.zshrc`.
 
 ### One-line install or update
 
@@ -76,7 +76,7 @@ cargo build --release
 
 ### Uninstall
 
-Run `./uninstall.sh` from the release folder or the repository. It removes the binary and the Quick Action.
+Run `./uninstall.sh` from the release folder or the repository. It removes the binary and both Quick Actions.
 
 ## Usage
 
@@ -84,14 +84,26 @@ Run `./uninstall.sh` from the release folder or the repository. It removes the b
 
 Select one or more movie files, right-click, and choose **Quick Actions > FPS Swap (24↔25)**. Each file is toggled (24 → 25 or 25 → 24) and you get one notification per file with the direction and frame count, or the reason it was refused.
 
+Then the action tags every movie in the folder of the selection with its frame rate, so it shows in Finder's **Tags** column (View > as List, right-click the column header > Tags). Each folder is handled once and is not searched recursively; movies are the non-hidden `.mov`, `.mp4` and `.m4v` files. If any tag changed you get one extra notification such as `3 tagged, 5 already tagged, 1 skipped`. Tagging runs after the swap and never changes its result.
+
+To tag without swapping, select movie files or folders and choose **Quick Actions > Tag FPS**. A selected folder is tagged; for a selected file, its folder is tagged. You always get one summary notification, for example `0 tagged, 5 already tagged, 0 skipped`.
+
+Tag names are `24 fps`, `25 fps`, `50 fps` for whole rates, and three decimals with trailing zeros dropped otherwise: `23.976 fps`, `29.97 fps`. Every other tag on the file is kept; only tags of the form `<number> fps` or `<number>.<number> fps` are replaced, so a tag you named like that yourself is treated as an fps tag. Running it again changes nothing. A file that cannot be read keeps its tags and is counted as skipped. A movie with no constant frame rate (variable rate, no video) gets no fps tag, and a stale one is removed.
+
+Notes on tags:
+
+- Finder tags are stored in an extended attribute (`com.apple.metadata:_kMDItemUserTags`), not in the movie. They can be lost when files are copied to exFAT or FAT drives, to some SMB shares, into zip files or through tools that drop extended attributes.
+- The movie files' own modification dates are not changed by tagging. When a tag changes, the **folder's** modification date is bumped once, to prompt SMB clients and caches to refresh. This has been checked locally (Spotlight shows the new tags within seconds) but not on a real SMB share.
+
 ### Command line
 
 ```
 usage: fps-swap [--to 24|25] [--dry-run] [--json] <file>...
        fps-swap info [--json] <file>...
+       fps-swap tag <file|folder>...
 ```
 
-Without `--to`, each file toggles. `--to 24` or `--to 25` sets the target and leaves files already at that rate unchanged. `--dry-run` runs every check and reports what would change without writing. `info` shows the rate, frame count, duration, tracks and timecode.
+`tag` sets the fps Finder tag described above on each file, or on every movie in each folder, and ends with a summary line. Without `--to`, each file toggles. `--to 24` or `--to 25` sets the target and leaves files already at that rate unchanged. `--dry-run` runs every check and reports what would change without writing. `info` shows the rate, frame count, duration, tracks and timecode.
 
 ```
 $ fps-swap info clip.mov

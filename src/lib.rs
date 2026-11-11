@@ -3,6 +3,7 @@
 
 pub mod atoms;
 pub mod conform;
+pub mod tags;
 #[cfg(test)]
 mod tests;
 

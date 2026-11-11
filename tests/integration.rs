@@ -573,3 +573,65 @@ fn pcm_rate_mismatch_converts_with_warning() {
     assert_eq!(ff.probe(&f).0, "24/1");
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn tag_folder_keeps_user_tags_and_file_dates() {
+    let Some((ffmpeg, ffprobe)) = tools("tag_folder") else {
+        return;
+    };
+    let ff = Ff { ffmpeg, ffprobe };
+    let dir = workdir("tag_folder");
+    let mov = dir.join("a.MOV");
+    ff.make(&mov, "prores", "24", Audio::None, true, &[]);
+    fs::write(dir.join("notes.txt"), b"not a movie").unwrap();
+    // Finder-written tags: Red, Selects, a stale "25 fps", 日本.
+    let apple = "62706C6973743030A401020304555265640A365953656C656374730A30583235206670730A306465E5672C000A0030080D131D26000000000000010100000000000000050000000000000000000000000000002F";
+    let attr = "com.apple.metadata:_kMDItemUserTags";
+    ok(
+        Path::new("/usr/bin/xattr"),
+        &["-wx", attr, apple, mov.to_str().unwrap()],
+    );
+    let mtime = |p: &Path| fs::metadata(p).unwrap().modified().unwrap();
+    let (file_t, dir_t) = (mtime(&mov), mtime(&dir));
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    let d = dir.to_str().unwrap();
+    let s = String::from_utf8_lossy(&fps_swap(&["tag", d]).stdout).into_owned();
+    assert!(
+        s.contains("a.MOV: tagged 24 fps")
+            && s.ends_with("1 tagged, 0 already tagged, 0 skipped\n"),
+        "{s}"
+    );
+    let hex: String = ok(
+        Path::new("/usr/bin/xattr"),
+        &["-px", attr, mov.to_str().unwrap()],
+    )
+    .split_whitespace()
+    .collect();
+    let has = |t: &str| hex.contains(&t.bytes().map(|b| format!("{b:02X}")).collect::<String>());
+    assert!(
+        has("Red\n6") && has("Selects\n0") && has("24 fps\n0") && !has("25 fps"),
+        "{hex}"
+    );
+    assert!(hex.contains("65E5672C"), "日本 kept: {hex}"); // UTF-16BE
+    assert_eq!(mtime(&mov), file_t, "movie date must not change");
+    let dir_t2 = mtime(&dir);
+    assert!(dir_t2 > dir_t, "folder date bumped");
+    assert!(
+        run(
+            Path::new("/usr/bin/xattr"),
+            &["-p", attr, dir.join("notes.txt").to_str().unwrap()]
+        )
+        .stdout
+        .is_empty()
+    );
+
+    // Idempotent: nothing written, folder date left alone.
+    let s = String::from_utf8_lossy(&fps_swap(&["tag", d]).stdout).into_owned();
+    assert!(
+        s.contains("24 fps, unchanged") && s.contains("0 tagged, 1 already tagged"),
+        "{s}"
+    );
+    assert_eq!(mtime(&dir), dir_t2);
+    let _ = fs::remove_dir_all(&dir);
+}

@@ -134,6 +134,7 @@ gives the same verdict.
     fps-swap --to 24|25 <file>... explicit target; no-op if already there
     fps-swap --dry-run <file>...  report what would change, write nothing
     fps-swap info <file>...       fps, frame count, duration, tracks, timecode
+    fps-swap tag <file|folder>... set the fps Finder tag (see §8); text only
     --json                        machine-readable output for all of the above
 
 Per file, print one line: `clip.mov: 25 → 24 fps, 312 frames, TC 01:00:00:00`
@@ -150,7 +151,25 @@ not be UTF-8 (printed lossily, also in JSON).
 - One Quick Action, "FPS Swap (24↔25)", for movie files in Finder, accepting a
   multi-selection. It calls the CLI and shows a macOS notification with the
   direction and frame count per file, or the refusal reason.
-- `install.sh` installs the binary and the Quick Action for the current user
+- After the swap, the same Quick Action runs `fps-swap tag` on the folder of
+  each selected file. `tag` expands a folder to its non-hidden `.mov`/`.mp4`/
+  `.m4v` regular files (not recursive) and sets a Finder tag naming the rate
+  that `info` reports: `N fps` for N/1, otherwise the rate to three decimals
+  with trailing zeros trimmed (`23.976 fps`, `29.97 fps`). Tags live in the
+  `com.apple.metadata:_kMDItemUserTags` xattr (binary plist array of strings).
+  Only tags matching `<digits>[.<digits>] fps` (any colour) are replaced; all
+  other tags are kept byte for byte, and an fps tag that is already right is
+  not rewritten (idempotent). A file that cannot be parsed, or whose tags
+  cannot be decoded, is left untouched; a parsed movie with no constant rate
+  loses any fps tag. Movie modification dates are never changed by tagging;
+  each folder in which a tag changed gets its modification date set to now,
+  once, so network clients refresh. Tagging never affects the swap result or
+  its notifications; it shows at most one summary notification, and only when
+  a tag changed.
+- A second Quick Action, "Tag FPS", for movie files and folders, never swaps:
+  it runs `fps-swap tag` on each selected folder and on the folder of each
+  selected file, and always shows one summary notification.
+- `install.sh` installs the binary and both Quick Actions for the current user
   without sudo and clears quarantine; `uninstall.sh` removes both.
 - GitHub Actions: on push/PR run fmt, clippy (`-D warnings`) and tests on
   macOS; on a `v*` tag build the universal binary and attach a zip (binary,

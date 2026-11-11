@@ -4,9 +4,10 @@ set -euo pipefail
 
 rm -f "$HOME/.local/bin/fps-swap"
 rm -rf "$HOME/Library/Services/FPS Swap (24↔25).workflow"
+rm -rf "$HOME/Library/Services/Tag FPS.workflow"
 
 if [ -x /System/Library/CoreServices/pbs ]; then
   /System/Library/CoreServices/pbs -update || true
 fi
 
-echo "Removed fps-swap and the FPS Swap (24↔25) Quick Action."
+echo "Removed fps-swap and the FPS Swap (24↔25) and Tag FPS Quick Actions."

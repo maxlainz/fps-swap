@@ -59,7 +59,8 @@
 				<key>ActionParameters</key>
 				<dict>
 					<key>COMMAND_STRING</key>
-					<string># FPS Swap (24↔25): toggle each selected file, one notification per file.
+					<string># FPS Swap (24↔25): toggle each selected file, one notification per file,
+# then refresh the fps Finder tags of every movie in the selection's folder(s).
 # Plain-text CLI output (one line per file, errors on stderr) is used on purpose: no jq/python needed.
 BIN="$HOME/.local/bin/fps-swap"
 
@@ -83,6 +84,18 @@ for f in "$@"; do
   msg=$(printf '%s' "$out" | tr '\n' ' ')
   notify "$name" "${msg:-done}"
 done
+
+# Then tag every movie in the selection's folder(s) with its rate ("25 fps") for
+# Finder's Tags column. Kept apart from the swap: it never changes the results above.
+dirs=()
+for f in "$@"; do dirs+=("$(dirname "$f")"); done
+if [ ${#dirs[@]} -gt 0 ]; then
+  sum=$("$BIN" tag "${dirs[@]}" 2&gt;/dev/null | tail -n 1)
+  case "$sum" in
+    "0 tagged, "*) ;;  # no tag changed: stay quiet
+    *) d=${dirs[0]}; notify "Tags: ${d##*/}" "${sum:-tagging failed}" ;;
+  esac
+fi
 exit 0
 </string>
 					<key>CheckedForUserDefaultShell</key>

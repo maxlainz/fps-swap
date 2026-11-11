@@ -7,8 +7,7 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 bin_dir="$HOME/.local/bin"
 services_dir="$HOME/Library/Services"
-wf_name="FPS Swap (24↔25).workflow"
-wf_src="$here/quickaction/$wf_name"
+workflows=("FPS Swap (24↔25).workflow" "Tag FPS.workflow")
 
 if [ -f "$here/fps-swap" ]; then
   bin_src="$here/fps-swap"
@@ -18,26 +17,31 @@ else
   echo "error: fps-swap binary not found next to install.sh or in target/release/ (run: cargo build --release)" >&2
   exit 1
 fi
-if [ ! -d "$wf_src" ]; then
-  echo "error: Quick Action not found at $wf_src" >&2
-  exit 1
-fi
+for wf in "${workflows[@]}"; do
+  if [ ! -d "$here/quickaction/$wf" ]; then
+    echo "error: Quick Action not found at $here/quickaction/$wf" >&2
+    exit 1
+  fi
+done
 
 mkdir -p "$bin_dir" "$services_dir"
 install -m 755 "$bin_src" "$bin_dir/fps-swap"
-rm -rf "${services_dir:?}/$wf_name"
-cp -R "$wf_src" "$services_dir/"
-
-# Downloaded files carry quarantine; Gatekeeper would block the unsigned binary.
-xattr -dr com.apple.quarantine "$bin_dir/fps-swap" "$services_dir/$wf_name" 2>/dev/null || true
+for wf in "${workflows[@]}"; do
+  rm -rf "${services_dir:?}/$wf"
+  cp -R "$here/quickaction/$wf" "$services_dir/"
+  # Downloaded files carry quarantine; Gatekeeper would block the unsigned binary.
+  xattr -dr com.apple.quarantine "$services_dir/$wf" 2>/dev/null || true
+done
+xattr -dr com.apple.quarantine "$bin_dir/fps-swap" 2>/dev/null || true
 
 if [ -x /System/Library/CoreServices/pbs ]; then
   /System/Library/CoreServices/pbs -update || true
 fi
 
 echo "Installed $bin_dir/fps-swap"
-echo "Installed $services_dir/$wf_name"
+for wf in "${workflows[@]}"; do echo "Installed $services_dir/$wf"; done
 echo "Finder: right-click movie files > Quick Actions > FPS Swap (24↔25)"
+echo "Finder: right-click movie files or folders > Quick Actions > Tag FPS"
 
 case ":$PATH:" in
   *":$bin_dir:"*) ;;

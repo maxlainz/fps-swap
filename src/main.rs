@@ -2,24 +2,29 @@
 
 use fps_swap::atoms::fourcc;
 use fps_swap::conform::{frames, tc_label, video_rate};
-use fps_swap::{Movie, Target, conform_file, inspect};
-use std::collections::HashMap;
+use fps_swap::{Movie, Target, conform_file, inspect, tags};
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::SystemTime;
 
 const USAGE: &str = "\
 usage: fps-swap [--to 24|25] [--dry-run] [--json] <file>...
        fps-swap info [--json] <file>...
+       fps-swap tag <file|folder>...
 
 Conforms MOV/MP4 files between exactly 24 and 25 fps by rewriting container
-timing in place. Without --to, each file toggles (24 -> 25, 25 -> 24).";
+timing in place. Without --to, each file toggles (24 -> 25, 25 -> 24).
+tag sets a Finder tag such as '25 fps' on each file, or on every movie in a
+folder, keeping all other tags.";
 
 fn main() -> ExitCode {
     // File names need not be UTF-8: keep them as OsString, print them lossily.
     let mut args = std::env::args_os().skip(1).peekable();
     let info = args.next_if(|a| a == "info").is_some();
+    let tag = !info && args.next_if(|a| a == "tag").is_some();
     let (mut target, mut dry_run, mut json) = (Target::Toggle, false, false);
     let mut files: Vec<OsString> = Vec::new();
     let mut flags_done = false;
@@ -28,9 +33,9 @@ fn main() -> ExitCode {
         match s {
             _ if flags_done => files.push(a),
             "--" => flags_done = true,
-            "--json" => json = true,
-            "--dry-run" if !info => dry_run = true,
-            "--to" if !info => match args.next().as_ref().and_then(|a| a.to_str()) {
+            "--json" if !tag => json = true,
+            "--dry-run" if !info && !tag => dry_run = true,
+            "--to" if !info && !tag => match args.next().as_ref().and_then(|a| a.to_str()) {
                 Some("24") => target = Target::To(24),
                 Some("25") => target = Target::To(25),
                 _ => return usage("--to takes 24 or 25"),
@@ -49,6 +54,9 @@ fn main() -> ExitCode {
     }
     if files.is_empty() {
         return usage("no files given");
+    }
+    if tag {
+        return run_tag(&files);
     }
 
     let mut ok = true;
@@ -189,6 +197,98 @@ fn refused(file: &str, reason: &str, json: bool) -> (bool, String) {
     }
     eprintln!("{file}: refused: {reason}");
     (false, String::new())
+}
+
+/// SPEC §8: tag each file (folders expand to their movies) with its rate. A
+/// folder whose tags changed gets its modification date bumped once, so network
+/// clients refresh; the movies' own dates are left alone.
+fn run_tag(args: &[OsString]) -> ExitCode {
+    let mut ok = true;
+    let mut files = Vec::new();
+    for a in args {
+        let p = Path::new(a);
+        if !p.is_dir() {
+            files.push(p.to_path_buf());
+            continue;
+        }
+        match tags::videos_in(p) {
+            Ok(v) => files.extend(v),
+            Err(e) => {
+                eprintln!("{}: skipped: {e}", p.display());
+                ok = false;
+            }
+        }
+    }
+    let (mut changed, mut same, mut skipped) = (0, 0, 0);
+    let mut seen = HashSet::new();
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for f in &files {
+        if let Ok(m) = std::fs::metadata(f)
+            && !seen.insert((m.dev(), m.ino()))
+        {
+            continue;
+        }
+        let file = f.display();
+        // A file we cannot read keeps its tags: the failure may be transient.
+        let m = match inspect(f) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("{file}: skipped: {e}");
+                (ok, skipped) = (false, skipped + 1);
+                continue;
+            }
+        };
+        let fps = m
+            .tracks
+            .iter()
+            .position(|t| &t.handler == b"vide")
+            .and_then(|i| rate(&m, i));
+        let name = fps.map(|(a, b)| tags::tag_name(a, b));
+        let what = name.as_deref().unwrap_or("no constant frame rate");
+        match tags::set_fps_tag(f, name.as_deref()) {
+            Ok(true) => {
+                match &name {
+                    Some(n) => println!("{file}: tagged {n}"),
+                    None => println!("{file}: {what}, fps tag removed"),
+                }
+                changed += usize::from(name.is_some());
+                let dir = f.parent().map_or_else(|| ".".into(), |d| d.to_path_buf());
+                if !dirs.contains(&dir) {
+                    dirs.push(dir);
+                }
+            }
+            Ok(false) => {
+                println!("{file}: {what}, unchanged");
+                same += usize::from(name.is_some());
+            }
+            Err(e) => {
+                eprintln!("{file}: skipped: cannot set tag: {e}");
+                (ok, skipped) = (false, skipped + 1);
+                continue;
+            }
+        }
+        // No constant rate: any stale fps tag was removed above; counted as skipped.
+        skipped += usize::from(name.is_none());
+    }
+    for d in &dirs {
+        let d = if d.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            d
+        };
+        if let Err(e) = std::fs::File::open(d).and_then(|h| h.set_modified(SystemTime::now())) {
+            eprintln!(
+                "{}: warning: could not update folder date: {e}",
+                d.display()
+            );
+        }
+    }
+    println!("{changed} tagged, {same} already tagged, {skipped} skipped");
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 fn rate(m: &Movie, i: usize) -> Option<(u64, u64)> {
